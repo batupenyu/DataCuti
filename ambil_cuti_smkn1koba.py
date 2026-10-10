@@ -2,34 +2,40 @@
 # -*- coding: utf-8 -*-
 """
 Script untuk mengambil data cuti pegawai khusus SMK Negeri 1 Koba
-Data source: data.xlsx (Sheet1), libur.xlsx (daftar hari libur nasional)
+Data source: data.xlsx (Sheet1), libur.xlsx (daftar hari libur nasional),
+             data_pegawai.xlsx (master pegawai: NAMA, NIP, GOL, PANGKAT, JABATAN)
 
 Modul ini juga dipakai oleh app_cuti.py (Streamlit); jalankan langsung
 untuk mode CLI seperti sebelumnya.
 """
 
 import os
+import re
+import shutil
 from datetime import datetime
 
 import pandas as pd
 
 EXCEL_PATH = os.path.join(os.path.dirname(__file__), "data.xlsx")
 LIBUR_PATH = os.path.join(os.path.dirname(__file__), "libur.xlsx")
+PEGAWAI_PATH = os.path.join(os.path.dirname(__file__), "data_pegawai.xlsx")
 OUTPUT_CSV = os.path.join(os.path.dirname(__file__), "data_cuti_smkn1koba.csv")
 
 JENIS_CUTI = "CUTI TAHUNAN"
+UNIT_KERJA_DEFAULT = "SMK Negeri 1 Koba"
 
 QUOTA_PER_YEAR = 12
 MAX_CARRYOVER = 6
 
-# data.xlsx tidak memakai header; kolom dituju oleh indeks:
-# Kolom G (idx 6) = Tgl_mulai_cuti, Kolom H (idx 7) = Tgl_selesai_cuti
 colNama = 0
 colJenis = 1
 colTglMulai = 6
 colTglSelesai = 7
 
 
+# ---------------------------------------------------------------------------
+# Util
+# ---------------------------------------------------------------------------
 def parse_date(val):
     if pd.isna(val):
         return None
@@ -56,6 +62,18 @@ def count_weekdays(start, end, libur_set):
     return days
 
 
+def _norm_nama(s):
+    """Normalisasi nama: uppercase, hapus tanda baca, rapikan spasi."""
+    if pd.isna(s):
+        return ""
+    s = str(s).upper()
+    s = re.sub(r"[^A-Z0-9\s]", " ", s)
+    return " ".join(s.split())
+
+
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
 def load_libur(path_or_buffer):
     """Baca libur.xlsx (header di baris ke-2) menjadi set tanggal libur."""
     libur_df = pd.read_excel(path_or_buffer, header=1)
@@ -64,12 +82,61 @@ def load_libur(path_or_buffer):
     return set(pd.to_datetime(libur_df["Tanggal"], errors="coerce").dropna().dt.date)
 
 
-def load_cuti_dataframe(path_or_buffer, libur_dates):
-    """Baca data.xlsx (Sheet1 tanpa header) dan hitung lama cuti per rekam.
+def load_pegawai(path_or_buffer):
+    """Baca data_pegawai.xlsx menjadi DataFrame ter-normalisasi.
 
-    Hanya jenis CUTI TAHUNAN yang dihitung; Sabtu/Minggu dan tanggal dalam
-    libur_dates tidak masuk perhitungan hari.
+    Kolom yang diharapkan: NAMA, NIP, GOL, PANGKAT, JABATAN.
+    Menambahkan kolom kunci `nama_key` untuk pencocokan.
     """
+    df = pd.read_excel(path_or_buffer)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    for col in ("NAMA", "NIP", "GOL", "PANGKAT", "JABATAN"):
+        if col not in df.columns:
+            df[col] = ""
+
+    df["nama_key"] = df["NAMA"].apply(_norm_nama)
+    df = df.drop_duplicates(subset=["nama_key"], keep="first").reset_index(drop=True)
+    return df
+
+
+def get_pegawai_info(pegawai_df, nama):
+    """Ambil dict info pegawai berdasarkan nama (case-insensitive)."""
+    kosong = {"nama": nama, "nip": "-", "gol": "-", "pangkat": "-", "jabatan": "-"}
+    if pegawai_df is None or pegawai_df.empty:
+        return kosong
+    key = _norm_nama(nama)
+    row = pegawai_df[pegawai_df["nama_key"] == key]
+    if row.empty:
+        return kosong
+    r = row.iloc[0]
+    return {
+        "nama": str(r["NAMA"]),
+        "nip": str(r["NIP"]) if pd.notna(r["NIP"]) else "-",
+        "gol": str(r["GOL"]) if pd.notna(r["GOL"]) else "-",
+        "pangkat": str(r["PANGKAT"]) if pd.notna(r["PANGKAT"]) else "-",
+        "jabatan": str(r["JABATAN"]) if pd.notna(r["JABATAN"]) else "-",
+    }
+
+
+def cek_pencocokan_nama(output, pegawai_df):
+    """Diagnostik: tampilkan nama yang tidak ketemu di data_pegawai.xlsx."""
+    nama_cuti = set(output["Nama"].dropna().apply(_norm_nama))
+    nama_master = set(pegawai_df["nama_key"])
+    tidak_ketemu = sorted(nama_cuti - nama_master)
+    if tidak_ketemu:
+        print("\n[PERINGATAN] Nama berikut ada di data.xlsx tapi TIDAK ADA di data_pegawai.xlsx:")
+        for n in tidak_ketemu:
+            print(f"  - {n}")
+    else:
+        print("\n[OK] Semua nama di data.xlsx cocok dengan data_pegawai.xlsx")
+    return tidak_ketemu
+
+
+# ---------------------------------------------------------------------------
+# Data cuti
+# ---------------------------------------------------------------------------
+def load_cuti_dataframe(path_or_buffer, libur_dates):
     df = pd.read_excel(path_or_buffer, sheet_name="Sheet1", header=None)
 
     maskJenis = df[colJenis].astype(str).str.upper().str.contains(JENIS_CUTI, na=False)
@@ -102,16 +169,6 @@ def load_cuti_dataframe(path_or_buffer, libur_dates):
 
 
 def hitung_rekap(output):
-    """Rekap saldo cuti per pegawai per tahun dengan rantai akumulasi.
-
-    Rantai akumulasi mulai dari N-2 (dua tahun sebelum tahun berjalan):
-    - kuota tahun N = 12 + akumulasi yang terbawa dari tahun sebelumnya.
-    - Jika tahun tersebut tidak ada ambil cuti, carryover boleh maksimal 12 hari.
-    - Jika ada ambil cuti, carryover maksimal 6 hari.
-    - Total akumulasi maksimal 12 hari → kuota maksimal 24 hari.
-    Kolom sisa_cuti_current_year berarti jumlah yang dibawa ke tahun berikutnya
-    (boleh lebih kecil dari kuota - cuti, mis. tahun tanpa cuti hanya membawa 6).
-    """
     usage_by_year = output.groupby(["Nama", "Tahun_cuti"], as_index=False)["Jumlah_hari_cuti"].sum()
     tahun_berjalan = int(output["Tahun_cuti"].max())
 
@@ -127,7 +184,6 @@ def hitung_rekap(output):
             sisa_pokok = max(QUOTA_PER_YEAR - cuti, 0)
             sisa_akumulasi = max(akumulasi - max(cuti - QUOTA_PER_YEAR, 0), 0)
             carryover_total = sisa_pokok + sisa_akumulasi
-            # Setiap tahun maksimal 6 hari yang di-carry ke tahun berikutnya.
             akumulasi_berikutnya = min(carryover_total, MAX_CARRYOVER)
             akumulasi_masuk = akumulasi
             akumulasi = akumulasi_berikutnya
@@ -147,7 +203,6 @@ def hitung_rekap(output):
     rekap["sisa_tahun_n_minus_1"] = rekap["akumulasi"]
     rekap = rekap[["nama", "tahun", "cuti_current_year", "sisa_tahun_n_minus_1", "kuota_current_year", "sisa_di_tahun_ini", "sisa_cuti_current_year", "total_hari"]]
 
-    # Jika cuti di tahun N-1 dan N-2 bernilai 0, set akumulasi current year ke 12 (kuota 24).
     for idx, row in rekap.iterrows():
         if row["nama"] in usage_by_year["Nama"].values:
             for n, pm in usage_by_year.groupby("Nama"):
@@ -167,19 +222,11 @@ def hitung_rekap(output):
 
 
 def kartu_kendali(output, rekap, nama=None, tahun=None):
-    """Buat data kartu kendali cuti per pegawai sesuai struktur kartu_kendali.pdf.
-
-    Hanya menampilkan data cuti untuk current year (N).
-    Kolom: No, Surat Izin (Nomor, Tanggal), Lamanya (Dari Tgl, Sampai Tgl),
-    Jenis Cuti, Paraf, ATB, LHC, STB.
+    """Buat data kartu kendali cuti per pegawai.
 
     ATB = saldo cuti SEBELUM cuti pada baris tsb diambil (running balance).
     LHC = lama hari cuti pada baris tsb.
-    STB = ATB - LHC (sisa setelah cuti tsb diambil).
-
-    Jika `nama` diberikan, hanya menampilkan data untuk pegawai tersebut.
-    Jika `tahun` None, memakai tahun terakhir di rekap.
-    Nomor baris (`No`) direset ke 1 setiap kali nama pegawai berubah.
+    STB = ATB - LHC.
     """
     if tahun is None:
         tahun = int(rekap["tahun"].max())
@@ -191,10 +238,8 @@ def kartu_kendali(output, rekap, nama=None, tahun=None):
     if nama is not None:
         source = source[source["Nama"] == nama]
 
-    # Urutkan berdasarkan nama lalu tanggal agar running balance benar.
     source = source.sort_values(by=["Nama", "Tgl_mulai_cuti"])
 
-    # Saldo berjalan per pegawai untuk tahun yang diminta.
     saldo_berjalan = {}
     no_counter = 0
     last_nama = None
@@ -204,14 +249,12 @@ def kartu_kendali(output, rekap, nama=None, tahun=None):
             continue
 
         peg = r["Nama"]
-        # Reset nomor saat nama pegawai berganti.
         if peg != last_nama:
             no_counter = 1
             last_nama = peg
         else:
             no_counter += 1
 
-        # Inisialisasi saldo awal pegawai = kuota_current_year dari rekap.
         if peg not in saldo_berjalan:
             kuota_awal = rekap_map.get((peg, tahun), {}).get("kuota_current_year", 0)
             saldo_berjalan[peg] = int(kuota_awal)
@@ -219,7 +262,7 @@ def kartu_kendali(output, rekap, nama=None, tahun=None):
         atb = saldo_berjalan[peg]
         lhc = int(r["Jumlah_hari_cuti"]) if pd.notna(r["Jumlah_hari_cuti"]) else 0
         stb = atb - lhc
-        saldo_berjalan[peg] = stb  # update untuk baris berikutnya
+        saldo_berjalan[peg] = stb
 
         rows.append({
             "No": no_counter,
@@ -236,45 +279,11 @@ def kartu_kendali(output, rekap, nama=None, tahun=None):
     return pd.DataFrame(rows)
 
 
-def main():
-    libur_dates = load_libur(LIBUR_PATH)
-    output = load_cuti_dataframe(EXCEL_PATH, libur_dates)
-
-    output_xlsx = os.path.join(os.path.dirname(__file__), "data_cuti_smkn1koba.xlsx")
-    output_rekap_xlsx = os.path.join(os.path.dirname(__file__), "rekap_cuti_smkn1koba.xlsx")
-
-    # Simpan data cuti dengan format tanggal
-    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
-        output.to_excel(writer, index=False)
-        ws = writer.sheets["Sheet1"]
-        last_row = len(output) + 1
-        # Kolom: No(1), Nama(2), Keterangan(3), Tgl_mulai_cuti(4), Tgl_selesai_cuti(5)
-        for row in range(2, last_row + 1):
-            ws.cell(row=row, column=4).number_format = "DD/MM/YYYY"
-            ws.cell(row=row, column=5).number_format = "DD/MM/YYYY"
-    print(f"Data harus disimpan di: {output_xlsx}")
-    print(f"Total data cuti tahunan: {len(output)} record")
-    print(f"\nPreview data (5 baris pertama):")
-    print(output.head().to_string(index=False))
-
-    rekap = hitung_rekap(output)
-    rekap.to_excel(output_rekap_xlsx, index=False, engine="openpyxl")
-    print(f"\nRekap harus disimpan di: {output_rekap_xlsx}")
-    print(f"Total rekap: {len(rekap)} record")
-    print(f"\nPreview rekap (5 baris pertama):")
-    print(rekap.head().to_string(index=False))
-
-
+# ---------------------------------------------------------------------------
+# Output PDF
+# ---------------------------------------------------------------------------
 def generate_pdf(kartu, nama, nip, pangkat, jabatan, unit_kerja, tahun, path_out):
-    """Buat kartu kendali PDF sesuai struktur kartu_kendali.pdf (HTML + weasyprint).
-
-    Header tabel 2 baris dengan rowspan:
-      Baris 1 : No.(rs2) | Surat Izin(cs2) | Lamanya(cs2) | Jenis Cuti(rs2)
-                | Paraf(rs2) | ATB(rs2) | LHC(rs2) | STB(rs2)
-      Baris 2 : Nomor | Tanggal | Dari Tgl | Sampai Tgl
-
-    Body: setiap baris menampilkan ATB/LHC/STB sendiri (tanpa rowspan).
-    """
+    """Buat kartu kendali PDF (HTML + weasyprint)."""
     def _fmt_tgl(val):
         if val is None or (hasattr(val, "isna") and val.isna()):
             return "-"
@@ -286,14 +295,8 @@ def generate_pdf(kartu, nama, nip, pangkat, jabatan, unit_kerja, tahun, path_out
             return str(val)
 
     def _esc(s):
-        return (
-            str(s)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # --- Susun baris HTML body ---
     rows_html = ""
     for _, r in kartu.iterrows():
         rows_html += "<tr>"
@@ -404,5 +407,90 @@ NIP. 197708262006041005
     return path_out
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    libur_dates = load_libur(LIBUR_PATH)
+    output = load_cuti_dataframe(EXCEL_PATH, libur_dates)
+    pegawai_df = load_pegawai(PEGAWAI_PATH)
+    cek_pencocokan_nama(output, pegawai_df)
+
+    output_xlsx = os.path.join(os.path.dirname(__file__), "data_cuti_smkn1koba.xlsx")
+    output_rekap_xlsx = os.path.join(os.path.dirname(__file__), "rekap_cuti_smkn1koba.xlsx")
+
+    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
+        output.to_excel(writer, index=False)
+        ws = writer.sheets["Sheet1"]
+        last_row = len(output) + 1
+        for row in range(2, last_row + 1):
+            ws.cell(row=row, column=4).number_format = "DD/MM/YYYY"
+            ws.cell(row=row, column=5).number_format = "DD/MM/YYYY"
+    print(f"\nData disimpan di: {output_xlsx}")
+    print(f"Total data cuti tahunan: {len(output)} record")
+
+    rekap = hitung_rekap(output)
+    rekap.to_excel(output_rekap_xlsx, index=False, engine="openpyxl")
+    print(f"Rekap disimpan di: {output_rekap_xlsx}")
+    print(f"Total rekap: {len(rekap)} record")
+
+
+def generate_semua_kartu(tahun=None, out_dir=None, bersihkan=False):
+    """Generate kartu kendali PDF untuk SEMUA pegawai yang punya cuti di tahun tsb."""
+    libur_dates = load_libur(LIBUR_PATH)
+    output = load_cuti_dataframe(EXCEL_PATH, libur_dates)
+    rekap = hitung_rekap(output)
+    pegawai_df = load_pegawai(PEGAWAI_PATH)
+
+    if tahun is None:
+        tahun = int(rekap["tahun"].max())
+    if out_dir is None:
+        out_dir = os.path.join(os.path.dirname(__file__), "kartu_kendali")
+
+    if bersihkan and os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    pemilik_cuti = output[output["Tahun_cuti"] == tahun]["Nama"].dropna().unique()
+    urutan_master = list(pegawai_df["NAMA"]) if not pegawai_df.empty else []
+
+    def _urutan(nama):
+        try:
+            return urutan_master.index(nama)
+        except ValueError:
+            return 10**9
+
+    pemilik_cuti = sorted(pemilik_cuti, key=_urutan)
+
+    hasil = []
+    for nama_peg in pemilik_cuti:
+        kartu = kartu_kendali(output, rekap, nama=nama_peg, tahun=tahun)
+        if kartu.empty:
+            continue
+
+        info = get_pegawai_info(pegawai_df, nama_peg)
+        safe_name = "".join(c if c.isalnum() else "_" for c in str(info["nama"])).strip("_")
+        path_out = os.path.join(out_dir, f"kartu_kendali_{tahun}_{safe_name}.pdf")
+
+        generate_pdf(
+            kartu,
+            nama=info["nama"],
+            nip=info["nip"],
+            pangkat=info["pangkat"],
+            jabatan=info["jabatan"],
+            unit_kerja=UNIT_KERJA_DEFAULT,
+            tahun=tahun,
+            path_out=path_out,
+        )
+        hasil.append(path_out)
+        print(f"[OK] {info['nama']} (NIP: {info['nip']}) -> {path_out}")
+
+    return hasil
+
+
 if __name__ == "__main__":
     main()
+
+    print("\n=== Generate kartu kendali semua pegawai ===")
+    pdfs = generate_semua_kartu(bersihkan=True)
+    print(f"\nTotal PDF dibuat: {len(pdfs)}")
