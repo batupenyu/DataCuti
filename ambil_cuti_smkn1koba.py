@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Script untuk mengambil data cuti pegawai khusus SMK Negeri 1 Koba
+Data source: data.xlsx (Sheet1), libur.xlsx (daftar hari libur nasional)
+
+Modul ini juga dipakai oleh app_cuti.py (Streamlit); jalankan langsung
+untuk mode CLI seperti sebelumnya.
+"""
+
+import os
+from datetime import datetime
+
+import pandas as pd
+
+EXCEL_PATH = os.path.join(os.path.dirname(__file__), "data.xlsx")
+LIBUR_PATH = os.path.join(os.path.dirname(__file__), "libur.xlsx")
+OUTPUT_CSV = os.path.join(os.path.dirname(__file__), "data_cuti_smkn1koba.csv")
+
+JENIS_CUTI = "CUTI TAHUNAN"
+
+QUOTA_PER_YEAR = 12
+MAX_CARRYOVER = 6
+
+# data.xlsx tidak memakai header; kolom dituju oleh indeks:
+# Kolom G (idx 6) = Tgl_mulai_cuti, Kolom H (idx 7) = Tgl_selesai_cuti
+colNama = 0
+colJenis = 1
+colTglMulai = 6
+colTglSelesai = 7
+
+
+def parse_date(val):
+    if pd.isna(val):
+        return None
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return val
+    s = str(val).strip()
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def count_weekdays(start, end, libur_set):
+    if pd.isna(start) or pd.isna(end):
+        return 0
+    days = 0
+    current = start
+    while current <= end:
+        if current.weekday() < 5 and current.date() not in libur_set:
+            days += 1
+        current += pd.Timedelta(days=1)
+    return days
+
+
+def load_libur(path_or_buffer):
+    """Baca libur.xlsx (header di baris ke-2) menjadi set tanggal libur."""
+    libur_df = pd.read_excel(path_or_buffer, header=1)
+    libur_df.columns = ["Tanggal", "Keterangan", "Jenis"]
+    libur_df = libur_df.dropna(subset=["Tanggal"])
+    return set(pd.to_datetime(libur_df["Tanggal"], errors="coerce").dropna().dt.date)
+
+
+def load_cuti_dataframe(path_or_buffer, libur_dates):
+    """Baca data.xlsx (Sheet1 tanpa header) dan hitung lama cuti per rekam.
+
+    Hanya jenis CUTI TAHUNAN yang dihitung; Sabtu/Minggu dan tanggal dalam
+    libur_dates tidak masuk perhitungan hari.
+    """
+    df = pd.read_excel(path_or_buffer, sheet_name="Sheet1", header=None)
+
+    maskJenis = df[colJenis].astype(str).str.upper().str.contains(JENIS_CUTI, na=False)
+    filtered = df[maskJenis].copy()
+
+    filtered["tgl_mulai_dt"] = pd.to_datetime(filtered[colTglMulai].apply(parse_date), errors="coerce")
+    filtered["tgl_selesai_dt"] = pd.to_datetime(filtered[colTglSelesai].apply(parse_date), errors="coerce")
+    filtered["tahun_cuti"] = filtered["tgl_mulai_dt"].dt.year
+
+    filtered["jumlah_hari_cuti"] = filtered.apply(
+        lambda row: count_weekdays(row["tgl_mulai_dt"], row["tgl_selesai_dt"], libur_dates), axis=1
+    )
+
+    output = pd.DataFrame({
+        "No": range(1, len(filtered) + 1),
+        "Nama": filtered[colNama],
+        "Keterangan": filtered[2],
+        "Tgl_mulai_cuti": filtered["tgl_mulai_dt"],
+        "Tgl_selesai_cuti": filtered["tgl_selesai_dt"],
+        "Tahun_cuti": filtered["tahun_cuti"].astype("Int64"),
+        "Jumlah_hari_cuti": filtered["jumlah_hari_cuti"].astype("Int64"),
+    })
+
+    output = output.dropna(subset=["Tgl_mulai_cuti", "Tgl_selesai_cuti", "Tahun_cuti"])
+    output = output.drop_duplicates(subset=["Nama", "Tgl_mulai_cuti"], keep="first")
+    output = output.drop_duplicates(subset=["Nama", "Tgl_mulai_cuti", "Tgl_selesai_cuti"], keep="first")
+    output = output.sort_values(by=["Tgl_mulai_cuti", "Nama"], ascending=False).reset_index(drop=True)
+    output["No"] = range(1, len(output) + 1)
+    return output
+
+
+def hitung_rekap(output):
+    """Rekap saldo cuti per pegawai per tahun dengan rantai akumulasi.
+
+    Rantai akumulasi mulai dari N-2 (dua tahun sebelum tahun berjalan):
+    - kuota tahun N = 12 + akumulasi yang terbawa dari tahun sebelumnya.
+    - Jika tahun tersebut tidak ada ambil cuti, carryover boleh maksimal 12 hari.
+    - Jika ada ambil cuti, carryover maksimal 6 hari.
+    - Total akumulasi maksimal 12 hari → kuota maksimal 24 hari.
+    Kolom sisa_cuti_current_year berarti jumlah yang dibawa ke tahun berikutnya
+    (boleh lebih kecil dari kuota - cuti, mis. tahun tanpa cuti hanya membawa 6).
+    """
+    usage_by_year = output.groupby(["Nama", "Tahun_cuti"], as_index=False)["Jumlah_hari_cuti"].sum()
+    tahun_berjalan = int(output["Tahun_cuti"].max())
+
+    saldo_rows = []
+    for nama, person_usage in usage_by_year.groupby("Nama"):
+        usage_map = person_usage.set_index("Tahun_cuti")["Jumlah_hari_cuti"].astype(int).to_dict()
+        usage_map = {int(k): int(v) for k, v in usage_map.items()}
+        mulai = tahun_berjalan - 2
+        akumulasi = 0
+        for tahun in range(mulai, tahun_berjalan + 1):
+            cuti = usage_map.get(tahun, 0)
+            kuota = QUOTA_PER_YEAR + akumulasi
+            sisa_pokok = max(QUOTA_PER_YEAR - cuti, 0)
+            sisa_akumulasi = max(akumulasi - max(cuti - QUOTA_PER_YEAR, 0), 0)
+            carryover_total = sisa_pokok + sisa_akumulasi
+            # Setiap tahun maksimal 6 hari yang di-carry ke tahun berikutnya.
+            akumulasi_berikutnya = min(carryover_total, MAX_CARRYOVER)
+            akumulasi_masuk = akumulasi
+            akumulasi = akumulasi_berikutnya
+            saldo_rows.append({
+                "Nama": nama,
+                "tahun": tahun,
+                "cuti_current_year": cuti,
+                "akumulasi": akumulasi_masuk,
+                "kuota_current_year": kuota,
+                "sisa_cuti_current_year": akumulasi_berikutnya,
+                "sisa_di_tahun_ini": kuota - cuti,
+            })
+
+    saldo = pd.DataFrame(saldo_rows)
+    rekap = saldo.rename(columns={"Nama": "nama"})
+    rekap["total_hari"] = rekap["cuti_current_year"]
+    rekap["sisa_tahun_n_minus_1"] = rekap["akumulasi"]
+    rekap = rekap[["nama", "tahun", "cuti_current_year", "sisa_tahun_n_minus_1", "kuota_current_year", "sisa_di_tahun_ini", "sisa_cuti_current_year", "total_hari"]]
+
+    # Jika cuti di tahun N-1 dan N-2 bernilai 0, set akumulasi current year ke 12 (kuota 24).
+    for idx, row in rekap.iterrows():
+        if row["nama"] in usage_by_year["Nama"].values:
+            for n, pm in usage_by_year.groupby("Nama"):
+                if n == row["nama"]:
+                    um = pm.set_index("Tahun_cuti")["Jumlah_hari_cuti"].astype(int).to_dict()
+                    cuti_n1 = um.get(row["tahun"] - 1, 0)
+                    cuti_n2 = um.get(row["tahun"] - 2, 0)
+                    if cuti_n1 == 0 and cuti_n2 == 0 and row["tahun"] == tahun_berjalan:
+                        rekap.at[idx, "sisa_tahun_n_minus_1"] = QUOTA_PER_YEAR
+                        rekap.at[idx, "kuota_current_year"] = QUOTA_PER_YEAR * 2
+                        rekap.at[idx, "sisa_di_tahun_ini"] = rekap.at[idx, "kuota_current_year"] - row["cuti_current_year"]
+                        rekap.at[idx, "sisa_cuti_current_year"] = min(rekap.at[idx, "sisa_di_tahun_ini"], MAX_CARRYOVER)
+
+    rekap = rekap.sort_values(by=["nama", "tahun"]).reset_index(drop=True)
+    rekap.insert(0, "No", range(1, len(rekap) + 1))
+    return rekap
+
+
+def kartu_kendali(output, rekap, nama=None, tahun=None):
+    """Buat data kartu kendali cuti per pegawai sesuai struktur kartu_kendali.pdf.
+
+    Hanya menampilkan data cuti untuk current year (N).
+    Kolom: No, Surat Izin (Nomor, Tanggal), Lamanya (Dari Tgl, Sampai Tgl),
+    Jenis Cuti, Paraf, ATB, LHC, STB.
+
+    ATB = saldo cuti SEBELUM cuti pada baris tsb diambil (running balance).
+    LHC = lama hari cuti pada baris tsb.
+    STB = ATB - LHC (sisa setelah cuti tsb diambil).
+
+    Jika `nama` diberikan, hanya menampilkan data untuk pegawai tersebut.
+    Jika `tahun` None, memakai tahun terakhir di rekap.
+    Nomor baris (`No`) direset ke 1 setiap kali nama pegawai berubah.
+    """
+    if tahun is None:
+        tahun = int(rekap["tahun"].max())
+
+    rekap_map = rekap.set_index(["nama", "tahun"])[["kuota_current_year"]].to_dict("index")
+
+    rows = []
+    source = output
+    if nama is not None:
+        source = source[source["Nama"] == nama]
+
+    # Urutkan berdasarkan nama lalu tanggal agar running balance benar.
+    source = source.sort_values(by=["Nama", "Tgl_mulai_cuti"])
+
+    # Saldo berjalan per pegawai untuk tahun yang diminta.
+    saldo_berjalan = {}
+    no_counter = 0
+    last_nama = None
+
+    for _, r in source.iterrows():
+        if int(r["Tahun_cuti"]) != tahun:
+            continue
+
+        peg = r["Nama"]
+        # Reset nomor saat nama pegawai berganti.
+        if peg != last_nama:
+            no_counter = 1
+            last_nama = peg
+        else:
+            no_counter += 1
+
+        # Inisialisasi saldo awal pegawai = kuota_current_year dari rekap.
+        if peg not in saldo_berjalan:
+            kuota_awal = rekap_map.get((peg, tahun), {}).get("kuota_current_year", 0)
+            saldo_berjalan[peg] = int(kuota_awal)
+
+        atb = saldo_berjalan[peg]
+        lhc = int(r["Jumlah_hari_cuti"]) if pd.notna(r["Jumlah_hari_cuti"]) else 0
+        stb = atb - lhc
+        saldo_berjalan[peg] = stb  # update untuk baris berikutnya
+
+        rows.append({
+            "No": no_counter,
+            "Surat Izin Nomor": "",
+            "Surat Izin Tanggal": "",
+            "Dari Tgl": r["Tgl_mulai_cuti"],
+            "Sampai Tgl": r["Tgl_selesai_cuti"],
+            "Jenis Cuti": JENIS_CUTI,
+            "Paraf": "",
+            "ATB": atb,
+            "LHC": lhc,
+            "STB": stb,
+        })
+    return pd.DataFrame(rows)
+
+
+def main():
+    libur_dates = load_libur(LIBUR_PATH)
+    output = load_cuti_dataframe(EXCEL_PATH, libur_dates)
+
+    output_xlsx = os.path.join(os.path.dirname(__file__), "data_cuti_smkn1koba.xlsx")
+    output_rekap_xlsx = os.path.join(os.path.dirname(__file__), "rekap_cuti_smkn1koba.xlsx")
+
+    # Simpan data cuti dengan format tanggal
+    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
+        output.to_excel(writer, index=False)
+        ws = writer.sheets["Sheet1"]
+        last_row = len(output) + 1
+        # Kolom: No(1), Nama(2), Keterangan(3), Tgl_mulai_cuti(4), Tgl_selesai_cuti(5)
+        for row in range(2, last_row + 1):
+            ws.cell(row=row, column=4).number_format = "DD/MM/YYYY"
+            ws.cell(row=row, column=5).number_format = "DD/MM/YYYY"
+    print(f"Data harus disimpan di: {output_xlsx}")
+    print(f"Total data cuti tahunan: {len(output)} record")
+    print(f"\nPreview data (5 baris pertama):")
+    print(output.head().to_string(index=False))
+
+    rekap = hitung_rekap(output)
+    rekap.to_excel(output_rekap_xlsx, index=False, engine="openpyxl")
+    print(f"\nRekap harus disimpan di: {output_rekap_xlsx}")
+    print(f"Total rekap: {len(rekap)} record")
+    print(f"\nPreview rekap (5 baris pertama):")
+    print(rekap.head().to_string(index=False))
+
+
+def generate_pdf(kartu, nama, nip, pangkat, jabatan, unit_kerja, tahun, path_out):
+    """Buat kartu kendali PDF sesuai struktur kartu_kendali.pdf (HTML + weasyprint).
+
+    Header tabel 2 baris dengan rowspan:
+      Baris 1 : No.(rs2) | Surat Izin(cs2) | Lamanya(cs2) | Jenis Cuti(rs2)
+                | Paraf(rs2) | ATB(rs2) | LHC(rs2) | STB(rs2)
+      Baris 2 : Nomor | Tanggal | Dari Tgl | Sampai Tgl
+
+    Body: setiap baris menampilkan ATB/LHC/STB sendiri (tanpa rowspan).
+    """
+    def _fmt_tgl(val):
+        if val is None or (hasattr(val, "isna") and val.isna()):
+            return "-"
+        try:
+            if hasattr(val, "strftime"):
+                return val.strftime("%d-%m-%Y")
+            return str(val)
+        except Exception:
+            return str(val)
+
+    def _esc(s):
+        return (
+            str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    # --- Susun baris HTML body ---
+    rows_html = ""
+    for _, r in kartu.iterrows():
+        rows_html += "<tr>"
+        rows_html += f"<td class='num'>{int(r['No'])}</td>"
+        rows_html += f"<td>{_esc(r.get('Surat Izin Nomor', '') or '-')}</td>"
+        rows_html += f"<td>{_esc(r.get('Surat Izin Tanggal', '') or '-')}</td>"
+        rows_html += f"<td class='num'>{_fmt_tgl(r.get('Dari Tgl', ''))}</td>"
+        rows_html += f"<td class='num'>{_fmt_tgl(r.get('Sampai Tgl', ''))}</td>"
+        rows_html += f"<td>{_esc(r.get('Jenis Cuti', ''))}</td>"
+        rows_html += "<td></td>"
+        rows_html += f"<td class='num'>{int(r['ATB'])}</td>"
+        rows_html += f"<td class='num'>{int(r['LHC'])}</td>"
+        rows_html += f"<td class='num'>{int(r['STB'])}</td>"
+        rows_html += "</tr>"
+
+    html = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ size: A4 landscape; margin: 15mm; }}
+  body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8pt; margin: 0; }}
+  .title {{ text-align: center; font-size: 11pt; font-weight: bold; margin: 0; }}
+  .sub {{ text-align: center; font-size: 9pt; margin: 2px 0; }}
+  .info {{ margin: 6px 0; font-size: 8pt; }}
+  .info td {{ vertical-align: top; padding: 1px 2px; }}
+  .info td:first-child {{ font-weight: bold; width: 35mm; }}
+  .info td:nth-child(2) {{ width: 5mm; }}
+  table.kk {{ width: 100%; border-collapse: collapse; font-size: 7pt; clear: both; }}
+  table.kk th, table.kk td {{
+    border: 0.5px solid black;
+    padding: 2px 3px;
+    text-align: center;
+    vertical-align: middle;
+  }}
+  table.kk th {{ background-color: #e0e0e0; }}
+  table.kk td.num {{ text-align: center; }}
+  table.kk td.left {{ text-align: left; }}
+  .footer-wrap {{ display: flex; justify-content: space-between; align-items: flex-start; margin-top: 8px; font-size: 8pt; padding-right: 3cm; }}
+  .legend {{ margin: 0; }}
+  .legend td {{ padding: 1px 2px; }}
+  .legend td:first-child {{ font-weight: bold; width: 30mm; }}
+  .footer {{ text-align: center; line-height: 1.4; margin-left: auto; }}
+</style>
+</head>
+<body>
+<div class="title">KARTU KENDALI CUTI PEGAWAI NEGERI SIPIL</div>
+<div class="sub">SMK NEGERI 1 KOBA</div>
+<div class="sub">CABANG DINAS PENDIDIKAN WILAYAH I</div>
+<div class="sub">DINAS PENDIDIKAN PROVINSI KEPULAUAN BANGKA BELITUNG</div>
+<div class="sub">TAHUN {tahun}</div>
+<table class="info">
+<tr><td>Nama</td><td>:</td><td>{_esc(nama)}</td></tr>
+<tr><td>NIP</td><td>:</td><td>{_esc(nip)}</td></tr>
+<tr><td>Pangkat/Gol. Ruang</td><td>:</td><td>{_esc(pangkat)}</td></tr>
+<tr><td>Jabatan</td><td>:</td><td>{_esc(jabatan)}</td></tr>
+<tr><td>Unit Kerja</td><td>:</td><td>{_esc(unit_kerja)}</td></tr>
+</table>
+<table class="kk">
+<thead>
+<tr>
+<th rowspan="2">No.</th>
+<th colspan="2">Surat Izin/Surat Keputusan</th>
+<th colspan="2">Lamanya</th>
+<th rowspan="2">Jenis Cuti</th>
+<th rowspan="2">Paraf Pegawai Kepegawaian</th>
+<th rowspan="2">ATB</th>
+<th rowspan="2">LHC</th>
+<th rowspan="2">STB</th>
+</tr>
+<tr>
+<th>Nomor</th>
+<th>Tanggal</th>
+<th>Dari Tgl</th>
+<th>Sampai Tgl</th>
+</tr>
+</thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+<div class="footer-wrap">
+<table class="legend">
+<tr><td>ATB</td><td>: Akumulasi Sisa Tahun Berjalan</td></tr>
+<tr><td>LHC</td><td>: Lama Hari Cuti</td></tr>
+<tr><td>STB</td><td>: Sisa Cuti Tahun Berjalan</td></tr>
+<tr><td>Alokasi Awal</td><td></td></tr>
+<tr><td>Tahun N</td><td>: 12</td></tr>
+<tr><td>Tahun N-1</td><td>: 6</td></tr>
+<tr><td>Tahun N-2</td><td>: 6</td></tr>
+<tr><td>Total Alokasi Awal</td><td>: 24</td></tr>
+</table>
+<div class="footer">
+Mengetahui,<br>
+Kepala SMK Negeri 1 Koba<br>
+<div style="height: 2cm;"></div>
+Syahryanto, S.T.,M.Pd<br>
+Pembina Tk.I, IV/b<br>
+NIP. 197708262006041005
+</div>
+</div>
+</body>
+</html>
+"""
+
+    from weasyprint import HTML
+    HTML(string=html).write_pdf(path_out)
+    return path_out
+
+
+if __name__ == "__main__":
+    main()
