@@ -573,7 +573,7 @@ def generate_surat_cuti(
     margin-bottom: 8px;
   }}
   .tanggal {{ text-align: right; margin-bottom: 4px; }}
-  .perihal {{ margin: 0 0 2px 0; }}
+  .perihal {{ margin: 0 0 12px 0; }}
   .perihal .label {{ display: inline-block; width: 22mm; }}
   .kepada {{ margin: 0; }}
   .pembuka {{ 
