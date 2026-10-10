@@ -71,6 +71,70 @@ def _norm_nama(s):
     return " ".join(s.split())
 
 
+def _angka_ke_kata(n):
+    """Konversi angka ke kata bahasa Indonesia (mis. 3 -> 'tiga')."""
+    n = int(n)
+    satuan = ["nol", "satu", "dua", "tiga", "empat", "lima", "enam",
+              "tujuh", "delapan", "sembilan", "sepuluh", "sebelas"]
+    if n < 12:
+        return satuan[n]
+    if n < 20:
+        return satuan[n - 10] + " belas"
+    if n < 100:
+        return satuan[n // 10] + " puluh" + (" " + satuan[n % 10] if n % 10 else "")
+    if n < 200:
+        return "seratus" + (" " + _angka_ke_kata(n - 100) if n > 100 else "")
+    if n < 1000:
+        return satuan[n // 100] + " ratus" + (" " + _angka_ke_kata(n % 100) if n % 100 else "")
+    if n < 2000:
+        return "seribu" + (" " + _angka_ke_kata(n - 1000) if n > 1000 else "")
+    return str(n)
+
+
+def _bersihkan_duplikat_gol(gol):
+    """Hilangkan duplikasi golongan, mis.
+    'Penata Tingkat I, III/d, III/d' -> 'Penata Tingkat I, III/d'.
+
+    - Memisahkan berdasarkan koma, titik-koma, atau baris baru.
+    - Normalisasi setiap bagian: strip, hapus karakter tak terlihat,
+      rapikan spasi ganda, dan samakan case untuk perbandingan.
+    - Duplikat (case-insensitive, spasi diabaikan) dibuang,
+      urutan asli dipertahankan.
+    """
+    if gol is None or (hasattr(gol, "isna") and pd.isna(gol)):
+        return "-"
+    s = str(gol).strip()
+    if not s or s == "-":
+        return s if s else "-"
+
+    # Normalisasi karakter tak terlihat & pemisah
+    s = s.replace("\u00a0", " ")   # non-breaking space
+    s = s.replace("\u200b", "")    # zero-width space
+    s = s.replace("\u2013", "-")   # en dash
+    s = s.replace("\u2014", "-")   # em dash
+    s = s.replace("\t", " ")
+    s = s.replace("\r", " ").replace("\n", ", ")
+    s = s.replace(";", ",")
+
+    parts = s.split(",")
+    hasil = []
+    seen = set()
+    for p in parts:
+        # Rapikan spasi ganda
+        p = " ".join(p.split()).strip()
+        if not p:
+            continue
+        # Kunci perbandingan: uppercase + hapus semua spasi
+        # agar 'III/d' == 'III / d' == 'III/d '
+        key = re.sub(r"\s+", "", p).upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        hasil.append(p)
+
+    return ", ".join(hasil) if hasil else "-"
+
+
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
@@ -83,11 +147,7 @@ def load_libur(path_or_buffer):
 
 
 def load_pegawai(path_or_buffer):
-    """Baca data_pegawai.xlsx menjadi DataFrame ter-normalisasi.
-
-    Kolom yang diharapkan: NAMA, NIP, GOL, PANGKAT, JABATAN.
-    Menambahkan kolom kunci `nama_key` untuk pencocokan.
-    """
+    """Baca data_pegawai.xlsx menjadi DataFrame ter-normalisasi."""
     df = pd.read_excel(path_or_buffer)
     df.columns = [str(c).strip().upper() for c in df.columns]
 
@@ -101,7 +161,11 @@ def load_pegawai(path_or_buffer):
 
 
 def get_pegawai_info(pegawai_df, nama):
-    """Ambil dict info pegawai berdasarkan nama (case-insensitive)."""
+    """Ambil dict info pegawai berdasarkan nama (case-insensitive).
+
+    Golongan dibersihkan dari duplikasi, mis.
+    'Penata Tingkat I, III/d, III/d' -> 'Penata Tingkat I, III/d'.
+    """
     kosong = {"nama": nama, "nip": "-", "gol": "-", "pangkat": "-", "jabatan": "-"}
     if pegawai_df is None or pegawai_df.empty:
         return kosong
@@ -113,10 +177,17 @@ def get_pegawai_info(pegawai_df, nama):
     return {
         "nama": str(r["NAMA"]),
         "nip": str(r["NIP"]) if pd.notna(r["NIP"]) else "-",
-        "gol": str(r["GOL"]) if pd.notna(r["GOL"]) else "-",
+        "gol": _bersihkan_duplikat_gol(r["GOL"]),
         "pangkat": str(r["PANGKAT"]) if pd.notna(r["PANGKAT"]) else "-",
         "jabatan": str(r["JABATAN"]) if pd.notna(r["JABATAN"]) else "-",
     }
+
+
+def format_pangkat_gol(pangkat, gol):
+    """Gabungkan pangkat dan golongan tanpa mengulang komponen yang sama."""
+    if gol in ("-", ""):
+        return pangkat
+    return _bersihkan_duplikat_gol(f"{pangkat}, {gol}")
 
 
 def cek_pencocokan_nama(output, pegawai_df):
@@ -280,7 +351,7 @@ def kartu_kendali(output, rekap, nama=None, tahun=None):
 
 
 # ---------------------------------------------------------------------------
-# Output PDF
+# Output PDF: Kartu Kendali
 # ---------------------------------------------------------------------------
 def generate_pdf(kartu, nama, nip, pangkat, jabatan, unit_kerja, tahun, path_out):
     """Buat kartu kendali PDF (HTML + weasyprint)."""
@@ -404,6 +475,207 @@ NIP. 197708262006041005
 
     from weasyprint import HTML
     HTML(string=html).write_pdf(path_out)
+    return path_out
+
+
+# ---------------------------------------------------------------------------
+# Output PDF: Surat Cuti
+# ---------------------------------------------------------------------------
+def generate_surat_cuti(
+    nama, nip, pangkat_gol, jabatan, unit_kerja,
+    tanggal_surat, lama_hari, tgl_mulai, tgl_selesai,
+    alasan, alamat, kontak,
+    kepala_nama, kepala_pangkat, kepala_nip,
+    path_out,
+):
+    """Buat PDF Surat Permohonan Cuti Tahunan.
+
+    Layout:
+    - Kepada Yth. / Kepala SMK Negeri 1 Koba / di - / Koba  (masing-masing <br>)
+    - Data pemohon (Nama, NIP, Pangkat/Gol.Ruang, Jabatan, Unit Kerja)
+    - Paragraf 1: "Dengan ini mengajukan..." (justify, indent 10px)
+    - Paragraf 2: "Demikian permohonan..." (justify, indent 10px)
+    - Blok tanda tangan kiri (Mengetahui, / Kepala SMK Negeri 1 Koba) dan
+      kanan (Hormat saya, / Jabatan).
+    """
+    from datetime import datetime as _dt
+
+    def _esc(s):
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _to_dt(val):
+        """Normalisasi input tanggal (str/datetime) ke datetime."""
+        if val is None:
+            return None
+        if isinstance(val, str):
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return _dt.strptime(val, fmt)
+                except ValueError:
+                    continue
+            return None
+        return val
+
+    def _fmt_tgl_id(val):
+        """Format tanggal Indonesia: 22 September 2026."""
+        val = _to_dt(val)
+        if val is None:
+            return "-"
+        bulan = [
+            "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+            "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+        ]
+        return f"{val.day} {bulan[val.month]} {val.year}"
+
+    def _fmt_rentang_tgl_id(tgl_mulai, tgl_selesai):
+        """Format rentang tanggal Indonesia.
+
+        - Bulan & tahun sama  -> '10 sampai dengan 12 Oktober 2026'
+        - Bulan/tahun berbeda -> '10 September 2026 sampai dengan 12 Oktober 2026'
+        """
+        d1 = _to_dt(tgl_mulai)
+        d2 = _to_dt(tgl_selesai)
+        if d1 is None or d2 is None:
+            return "-"
+
+        if d1.month == d2.month and d1.year == d2.year:
+            # Bulan & tahun sama: bulan+tahun ditulis sekali di akhir
+            bulan = [
+                "", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+                "Juli", "Agustus", "September", "Oktober", "November", "Desember",
+            ]
+            return f"{d1.day} sampai dengan {d2.day} {bulan[d1.month]} {d1.year}"
+
+        # Bulan atau tahun berbeda: tulis lengkap dua tanggal
+        return f"{_fmt_tgl_id(d1)} sampai dengan {_fmt_tgl_id(d2)}"
+
+    tgl_surat_str = _fmt_tgl_id(tanggal_surat)
+    rentang_tgl_str = _fmt_rentang_tgl_id(tgl_mulai, tgl_selesai)
+    lama_hari_int = int(lama_hari)
+    lama_hari_kata = _angka_ke_kata(lama_hari_int)
+
+    html = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ size: A4 portrait; margin: 10mm 20mm 20mm; }}
+  body {{
+    font-family: "Times New Roman", Times, serif;
+    font-size: 12pt;
+    line-height: 1.5;
+    color: #000;
+  }}
+  .kop {{
+    display: block;
+    width: 100%;
+    height: auto;
+    margin-bottom: 8px;
+  }}
+  .tanggal {{ text-align: right; margin-bottom: 4px; }}
+  .perihal {{ margin: 0 0 2px 0; }}
+  .perihal .label {{ display: inline-block; width: 22mm; }}
+  .kepada {{ margin: 0; }}
+  .pembuka {{ 
+    text-indent: 30px;
+    margin-top: 14px;
+    }}
+  .data-pemohon {{
+    margin-left: 0mm;
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }}
+  .data-pemohon table {{ border-collapse: collapse; }}
+  .data-pemohon td {{ vertical-align: top; padding: 1px 0; }}
+  .data-pemohon td.label {{ width: 40mm; }}
+  .data-pemohon td.sep {{ width: 4mm; }}
+  /* Paragraf: justify + baris pertama menjorok 10px */
+  .paragraf {{
+    text-align: justify;
+    margin: 8px 0;
+    text-indent: 30px;
+  }}
+  .ttd-wrap {{
+    display: flex;
+    justify-content: space-between;
+    margin-top: 20px;
+    gap: 60px;
+  }}
+  .ttd-kiri, .ttd-kanan {{
+    width: auto;
+    text-align: center;
+  }}
+  .ttd-nama {{
+    margin-top: 65px;
+    font-weight: bold;
+    text-decoration: underline;
+  }}
+  .ttd-nip {{ margin-top: 1px; }}
+</style>
+</head>
+<body>
+
+<img class="kop" src="kop.png" alt="Kop surat">
+
+<div class="tanggal">Koba, {_esc(tgl_surat_str)}</div>
+
+<div class="perihal">
+  <span class="label">Perihal</span>: Permohonan Cuti Tahunan
+</div>
+
+<div class="kepada">
+  Kepada Yth.<br>
+  Kepala SMK Negeri 1 Koba<br>
+  di -<br>
+  Koba
+</div>
+
+<div class="pembuka">Yang bertanda tangan dibawah ini :</div>
+
+<div class="data-pemohon">
+  <table>
+    <tr><td class="label">Nama</td><td class="sep">:</td><td>{_esc(nama)}</td></tr>
+    <tr><td class="label">NIP</td><td class="sep">:</td><td>{_esc(nip)}</td></tr>
+    <tr><td class="label">Pangkat/Gol.Ruang</td><td class="sep">:</td><td>{_esc(pangkat_gol)}</td></tr>
+    <tr><td class="label">Jabatan</td><td class="sep">:</td><td>{_esc(jabatan)}</td></tr>
+    <tr><td class="label">Unit Kerja</td><td class="sep">:</td><td>{_esc(unit_kerja)}</td></tr>
+  </table>
+</div>
+
+<div class="paragraf">
+  Dengan ini mengajukan permintaan Cuti Tahunan selama {lama_hari_int} ({_esc(lama_hari_kata)}) hari kerja,
+  yaitu tanggal {_esc(rentang_tgl_str)},
+  dengan alasan {_esc(alasan)}, dengan alamat {_esc(alamat)} dengan nomor contact {_esc(kontak)},
+  selama menjalani cuti saya akan tetap mematuhi peraturan yang berlaku dan bersedia untuk dihubungi
+  sewaktu-waktu jika diperlukan.
+</div>
+
+<div class="paragraf">
+  Demikian permohonan ini disampaikan untuk dapat dipertimbangkan, atas perhatian Bapak diucapkan terima kasih.
+</div>
+
+<div class="ttd-wrap">
+  <div class="ttd-kiri">
+    Mengetahui,<br>
+    Kepala SMK Negeri 1 Koba
+    <div class="ttd-nama">{_esc(kepala_nama)}</div>
+    <div>{_esc(kepala_pangkat)}</div>
+    <div class="ttd-nip">NIP. {_esc(kepala_nip)}</div>
+  </div>
+  <div class="ttd-kanan">
+    Hormat saya,<br>{_esc(jabatan)}
+    <div class="ttd-nama">{_esc(nama)}</div>
+    <div>{_esc(pangkat_gol)}</div>
+    <div class="ttd-nip">NIP.{_esc(nip)}</div>
+  </div>
+</div>
+
+</body>
+</html>
+"""
+
+    from weasyprint import HTML
+    HTML(string=html, base_url=os.path.dirname(os.path.abspath(__file__))).write_pdf(path_out)
     return path_out
 
 
